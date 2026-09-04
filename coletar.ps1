@@ -13,6 +13,7 @@ Uso:
 [CmdletBinding()]
 param(
     [switch]$Rotacionar,
+    [string]$Script = 'baixar_fatura.py',   # ou coletar_varias.py p/ as 5 UCs
     [int]$Ciclos = $(if ($env:CICLOS) { [int]$env:CICLOS } else { 4 }),
     [int]$Port = $(if ($env:CDP_PORT) { [int]$env:CDP_PORT } else { 9222 })
 )
@@ -103,7 +104,7 @@ try {
         Write-Host "########## Ciclo $ciclo/$Ciclos - $(Get-Date -Format 'dd/MM HH:mm:ss') ##########"
         if (-not (Confirm-Chrome)) { Start-Sleep -Seconds 60; continue }
 
-        & $python baixar_fatura.py
+        & $python $Script
         if ($LASTEXITCODE -eq 0) {
             Write-Host "[$(Get-Date -Format HH:mm:ss)] Fatura baixada; encerrando"
             Get-ChildItem faturas\*.pdf -ErrorAction SilentlyContinue |
