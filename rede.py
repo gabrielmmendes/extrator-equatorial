@@ -262,42 +262,59 @@ def _esperar_ip(diferente_de, teto_s=45):
     return ultimo
 
 
-def rotacionar(teto_s=45):
+def _aviao(pausa=6):
+    """Liga e desliga o modo aviao (Android 11+). Levanta se indisponivel."""
+    adb("shell", "cmd", "connectivity", "airplane-mode", "enable")
+    time.sleep(pausa)
+    adb("shell", "cmd", "connectivity", "airplane-mode", "disable")
+
+
+def _toggle_dados(pausa=4):
+    """Desliga e religa o dado movel."""
+    adb("shell", "svc", "data", "disable")
+    time.sleep(pausa)
+    adb("shell", "svc", "data", "enable")
+
+
+def rotacionar(teto_s=45, metodo=None):
     """Forca a operadora a reatribuir o IP. Devolve (ip_antes, ip_depois).
 
-    Escalonamento em dois niveis, do menos ao mais destrutivo:
+    Medido no Galaxy S20 FE / CLARO: `svc data disable/enable` reconecta SEMPRE
+    no mesmo IP - nao adianta. O modo aviao troca o IP de fato (e para faixas
+    bem diferentes: 187.43.x -> 191.58.x -> 191.56.x), sem derrubar o tethering
+    USB nem o adb. Por isso o modo aviao e o metodo primario aqui; o toggle de
+    dado fica de reserva para aparelhos onde o aviao nao esteja disponivel
+    (Android <11, onde 'cmd connectivity' nao existe).
 
-    1. svc data disable/enable - derruba so o dado movel. O adaptador USB
-       continua existindo no Windows, entao o Chrome nao ve a interface sumir
-       (que e o que provoca ERR_NETWORK_CHANGED e perda de conexoes abertas).
-    2. modo aviao - mais agressivo, so se o nivel 1 nao mudou o IP. Em alguns
-       ROMs isto derruba o tethering USB e exige religar no aparelho, por isso
-       nao e a primeira escolha.
+    EQUATORIAL_ROTACAO=dados forca o toggle de dado primeiro, se algum aparelho
+    se comportar ao contrario.
     """
     aparelho_pronto()
+    metodo = (metodo or os.environ.get("EQUATORIAL_ROTACAO", "aviao")).lower()
+    ordem = ["dados", "aviao"] if metodo == "dados" else ["aviao", "dados"]
+
     antes = ip_publico()
     log(f"IP antes: {antes}")
-
-    adb("shell", "svc", "data", "disable")
-    time.sleep(4)
-    adb("shell", "svc", "data", "enable")
-    depois = _esperar_ip(antes, teto_s=teto_s)
-
-    if depois == antes:
-        log("Dado movel nao mudou o IP; escalando para modo aviao")
+    depois = antes
+    for m in ordem:
+        if depois and depois != antes:
+            break
         try:
-            adb("shell", "cmd", "connectivity", "airplane-mode", "enable")
-            time.sleep(6)
-            adb("shell", "cmd", "connectivity", "airplane-mode", "disable")
-            depois = _esperar_ip(antes, teto_s=teto_s)
+            if m == "aviao":
+                _aviao()
+            else:
+                _toggle_dados()
         except RuntimeError as e:
-            # 'cmd connectivity' so existe no Android 11+
-            log(f"Modo aviao indisponivel ({str(e)[:70]})")
+            log(f"Metodo '{m}' indisponivel ({str(e)[:60]}); tentando o proximo")
+            continue
+        depois = _esperar_ip(antes, teto_s=teto_s)
+        if depois == antes:
+            log(f"Metodo '{m}' nao mudou o IP")
 
     if depois is None:
         log("AVISO: sem IP publico apos a rotacao - o tethering pode ter caido")
     elif depois == antes:
-        log(f"IP nao mudou ({depois}) - esperado sob CGNAT")
+        log(f"IP nao mudou ({depois})")
     else:
         log(f"IP depois: {depois}")
     return antes, depois
