@@ -31,6 +31,11 @@ FATURAS = Path(__file__).parent / "faturas"
 ANOS_ATRAS = int(os.environ.get("EQUATORIAL_ANOS_ATRAS", "3"))
 SEL_CONSULTAR = ("#CONTENT_btEnviar, input[value*='Consultar' i], "
                  "button:has-text('Consultar')")
+BASE = "https://goias.equatorialenergia.com.br"
+# O botao OK do modal de protocolo. Confirmar aqui e o que de fato dispara o
+# download do PDF - abrir a mostrarEspelhoFatura.aspx apenas exibe o modal
+# "espelho gerado, protocolo N"; o binario so vem depois deste clique.
+SEL_OK_MODAL = "#CONTENT_btnModal, input[value='OK' i]"
 
 
 def dump_estrutura(page, rotulo):
@@ -170,89 +175,126 @@ def consultar(page):
     return None
 
 
-def salvar_pdf(page, ctx, acionar, nome):
-    """Dispara `acionar` e salva o PDF, tentando os tres caminhos possiveis.
+def _snapshot():
+    return {f: f.stat().st_size for f in FATURAS.glob("*") if f.is_file()}
 
-    O portal ora entrega o PDF como download, ora como navegacao para um
-    ashx/aspx que responde application/pdf, ora abre em aba nova. Um handler de
-    response cobre os casos em que o evento de download nao dispara.
+
+def baixar_espelho(ctx, invoice, nome):
+    """Baixa o PDF de uma fatura pelo seu indice `invoice` no grid.
+
+    Fluxo real do site (confirmado sondando a pagina): a coluna Download faz
+    window.open('mostrarEspelhoFatura.aspx?invoice=N'), que NAO entrega o PDF -
+    exibe um modal "espelho gerado, protocolo N". E o clique no botao OK desse
+    modal (#CONTENT_btnModal) que dispara o download do binario.
+
+    Como o Chrome e dirigido por CDP externo (nao lancado pelo Playwright),
+    download.save_as() grava 0 byte: quem escreve o arquivo e o proprio Chrome,
+    no downloadPath que configuramos. Entao nao usamos o evento do Playwright -
+    deixamos o Chrome baixar e capturamos o arquivo novo por varredura do
+    diretorio, esperando ele estabilizar (sem .crdownload).
     """
     FATURAS.mkdir(exist_ok=True)
-    capturado = {}
+    url = f"{BASE}/AgenciaGO/Servi%C3%A7os/comum/mostrarEspelhoFatura.aspx?invoice={invoice}"
 
-    def on_resp(r):
-        try:
-            ct = (r.headers or {}).get("content-type", "")
-            if "pdf" in ct.lower() and not capturado:
-                capturado["body"] = r.body()
-                capturado["url"] = r.url
-        except Exception:
-            pass
-
-    ctx.on("response", on_resp)
-    # sem isto o Chrome pode bloquear o download quando dirigido via CDP
+    pop = ctx.new_page()
     try:
-        cdp = ctx.new_cdp_session(page)
+        cdp = ctx.new_cdp_session(pop)
         cdp.send("Browser.setDownloadBehavior",
                  {"behavior": "allow", "downloadPath": str(FATURAS)})
     except Exception as e:
         log(f"(setDownloadBehavior indisponivel: {str(e)[:60]})")
 
-    destino = FATURAS / nome
+    antes = _snapshot()
     try:
-        with page.expect_download(timeout=30_000) as info:
-            acionar()
-        info.value.save_as(str(destino))
-        log(f"Baixado via evento de download: {destino.name}")
-        return destino
-    except PWTimeout:
-        pass
+        pop.goto(url, wait_until="domcontentloaded")
+        pop.wait_for_timeout(random.randint(1800, 2600))
+        clicou = pop.evaluate(
+            """(sel) => {
+                const cand = [...document.querySelectorAll(
+                    'input[type=button],input[type=submit],button,a')]
+                  .find(x => (x.matches(sel) ||
+                              /^\\s*ok\\s*$/i.test((x.value||x.innerText||'').trim()))
+                             && x.offsetParent !== null);
+                if (cand) { cand.click(); return true; }
+                return false;
+            }""",
+            SEL_OK_MODAL,
+        )
+        if not clicou:
+            log("Botao OK do modal nao encontrado no espelho")
+            return None
     finally:
-        ctx.remove_listener("response", on_resp)
+        # o download segue no Chrome mesmo com a aba fechada; fechar evita
+        # acumular abas ao longo das varias faturas
+        pop.wait_for_timeout(1500)
 
-    page.wait_for_timeout(4000)
-    if capturado.get("body"):
-        destino.write_bytes(capturado["body"])
-        log(f"Baixado via resposta PDF ({capturado['url'][:70]}): {destino.name}")
-        return destino
-
-    # ultima chance: alguma aba nova com o PDF
-    for pg in ctx.pages:
-        if ".pdf" in pg.url.lower() or "pdf" in pg.url.lower():
-            corpo = ctx.request.get(pg.url).body()
-            if corpo[:4] == b"%PDF":
-                destino.write_bytes(corpo)
-                log(f"Baixado da aba {pg.url[:70]}: {destino.name}")
+    destino = FATURAS / nome
+    alvo, prev, estavel = None, -1, 0
+    fim = time.time() + 45
+    while time.time() < fim:
+        agora = _snapshot()
+        novos = [f for f, s in agora.items()
+                 if s > 1000 and (f not in antes or antes[f] != s)
+                 and not f.name.endswith(".crdownload")]
+        pdfs = [f for f in novos if f.suffix.lower() == ".pdf" and f.read_bytes()[:4] == b"%PDF"]
+        if pdfs:
+            cand = pdfs[0]
+            estavel = estavel + 1 if (cand == alvo and agora[cand] == prev) else 0
+            alvo, prev = cand, agora[cand]
+            if estavel >= 2:
+                if cand != destino:
+                    if destino.exists():
+                        destino.unlink()
+                    cand.rename(destino)
+                log(f"Baixado: {destino.name} ({destino.stat().st_size} bytes)")
+                try:
+                    pop.close()
+                except Exception:
+                    pass
                 return destino
+        pop.wait_for_timeout(1000)
+
+    log("Download nao estabilizou em 45s")
+    try:
+        pop.close()
+    except Exception:
+        pass
     return None
 
 
+def linhas_faturas(page):
+    """Le a tabela e devolve [(invoice, rotulo)] da mais recente para a mais antiga.
+
+    O invoice sai do onclick (window.open(...invoice=N...)); o rotulo vem do
+    "Mes / Ano" da primeira coluna, para nomear o arquivo.
+    """
+    return page.evaluate(r"""() => {
+        const linhas = [...document.querySelectorAll('table tr')].slice(1);
+        const out = [];
+        for (const tr of linhas) {
+            const a = tr.querySelector('a[onclick*="invoice="]');
+            if (!a) continue;
+            const m = (a.getAttribute('onclick') || '').match(/invoice=(\d+)/);
+            if (!m) continue;
+            const ref = (tr.cells[0] ? tr.cells[0].innerText : '').trim();
+            out.push({ invoice: parseInt(m[1], 10), rotulo: ref });
+        }
+        return out;
+    }""")
+
+
 def baixar_mais_recente(page, ctx, ano):
-    """Identifica a fatura do topo da lista e baixa."""
-    est = dump_estrutura(page, f"download-{ano}")
-
-    tabela = max((t for t in est["tabelas"] if t["linhas"] > 1),
-                 key=lambda t: t["linhas"], default=None)
-    if tabela:
-        log(f"Tabela com {tabela['linhas']} linhas | cabecalho: {tabela['cabecalho']}")
-    else:
-        log("Nenhuma tabela com resultados")
-
-    # A fatura mais recente e a primeira linha; procuramos nela o acionador.
-    gatilho = page.locator(
-        "table tr:not(:first-child) a[href*='.pdf'], "
-        "table tr:not(:first-child) a[onclick], "
-        "table tr:not(:first-child) input[type=image], "
-        "table tr:not(:first-child) a"
-    ).first
-    if gatilho.count() == 0:
-        log(f"Nao achei link de download na tabela - veja estrutura-download-{ano}.json")
+    """Baixa o PDF da fatura do topo da lista (a mais recente)."""
+    dump_estrutura(page, f"download-{ano}")
+    linhas = linhas_faturas(page)
+    if not linhas:
+        log(f"Nao achei linhas com invoice na tabela - veja estrutura-download-{ano}.json")
         return None
 
-    rotulo = (gatilho.inner_text() or "fatura").strip() or "fatura"
-    log(f"Fatura mais recente: {rotulo!r}")
-    nome = f"fatura-{re.sub(r'[^0-9A-Za-z]+', '-', rotulo).strip('-') or time.strftime('%Y%m%d')}.pdf"
-    return salvar_pdf(page, ctx, lambda: gatilho.click(), nome)
+    alvo = linhas[0]  # invoice=0 = mais recente
+    ref = re.sub(r"[^0-9A-Za-z]+", "-", alvo["rotulo"]).strip("-") or ano
+    log(f"Fatura mais recente: {alvo['rotulo']!r} (invoice={alvo['invoice']})")
+    return baixar_espelho(ctx, alvo["invoice"], f"fatura-{ref}.pdf")
 
 
 def coletar():
