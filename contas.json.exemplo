@@ -1,0 +1,23 @@
+{
+  "_comentario": [
+    "Copie para contas.json e preencha. contas.json esta no .gitignore por",
+    "conter CPF/CNPJ de terceiros.",
+    "  uc   - digitos da UC (pontuacao e ignorada)",
+    "  doc  - CPF (11) ou CNPJ (14) do titular; define a PERSONA/perfil Chrome",
+    "  nasc - DD/MM/AAAA do titular, so para CPF; usado na 2a etapa do login",
+    "  apelido - livre, so aparece no log"
+  ],
+  "contas": [
+    {
+      "uc": "000000000000000",
+      "doc": "000.000.000-00",
+      "nasc": "01/01/1980",
+      "apelido": "exemplo-cpf"
+    },
+    {
+      "uc": "000000000000001",
+      "doc": "00.000.000/0001-00",
+      "apelido": "exemplo-cnpj"
+    }
+  ]
+}

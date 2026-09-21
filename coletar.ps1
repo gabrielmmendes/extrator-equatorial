@@ -9,10 +9,13 @@ o processo.
 Uso:
     .\coletar.ps1                      # sem rotacao de IP
     .\coletar.ps1 -Rotacionar          # com tethering USB (exige Administrador)
+    .\coletar.ps1 -Mes 07/2026         # um mes especifico, nao o mais recente
 #>
 [CmdletBinding()]
 param(
     [switch]$Rotacionar,
+    # Mes da fatura (MM/AAAA). Vazio = a mais recente.
+    [string]$Mes,
     [string]$Script = 'baixar_fatura.py',   # ou coletar_varias.py p/ as 5 UCs
     [int]$Ciclos = $(if ($env:CICLOS) { [int]$env:CICLOS } else { 4 }),
     [int]$Port = $(if ($env:CDP_PORT) { [int]$env:CDP_PORT } else { 9222 })
@@ -73,6 +76,10 @@ if ($Rotacionar) {
 } else {
     $env:EQUATORIAL_ROTACIONAR = '0'
 }
+
+# Vai por ambiente, e nao por argumento, porque o -Script pode ser o
+# coletar_varias.py, que nao le a linha de comando - os dois leem EQUATORIAL_MES.
+if ($Mes) { $env:EQUATORIAL_MES = $Mes }
 
 $python = if (Test-Path '.venv\Scripts\python.exe') { '.venv\Scripts\python.exe' } else { 'python' }
 

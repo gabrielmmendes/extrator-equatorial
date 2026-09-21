@@ -10,17 +10,25 @@ Camadas de defesa da pagina (todas verificadas em execucao):
 
 Nenhum desses tokens e forjavel por HTTP puro: dependem de JS lendo o ambiente
 real do navegador. Por isso dirigimos um Chrome de verdade via CDP (ver
-chrome.sh) em vez de deixar o Playwright lancar o browser, o que acrescentaria
---enable-automation e afins.
+navegador.py) em vez de deixar o Playwright lancar o browser, o que
+acrescentaria --enable-automation e afins.
+
+Este modulo faz UMA tentativa e diz o que aconteceu (tentar_login devolve
+(ok, motivo)). Quem decide se e quando repetir e a agenda.py, em escala de
+horas ou dias. O laco de horas que existia aqui saiu junto com a premissa que
+o sustentava - ver o cabecalho de agenda.py.
 """
 
 import os
 import random
+import re
 import sys
 import time
 from pathlib import Path
 
 from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
+
+import humano as H
 
 URL = "https://goias.equatorialenergia.com.br/LoginGO.aspx"
 URL_HOME = "https://goias.equatorialenergia.com.br/"
@@ -31,15 +39,20 @@ OUT = Path(__file__).parent / "saida"
 UC = "".join(filter(str.isdigit, os.environ.get("EQUATORIAL_UC", "")))
 DOC = "".join(filter(str.isdigit, os.environ.get("EQUATORIAL_DOC", "")))
 NASC = os.environ.get("EQUATORIAL_NASC", "").strip()  # DD/MM/AAAA
-# Pausa entre tentativas: intervalo curto e FIXO, sorteado nesta faixa.
-# Nao e backoff. A recusa #001/#002 e independente entre tentativas (o proprio
-# login manual humano tambem a recebe), entao esperar mais nao melhora a chance
-# da proxima - so gasta a janela. Em 51 min, ~50 tentativas contra 7 do
-# esquema exponencial anterior.
-ESPERA_BASE = int(os.environ.get("EQUATORIAL_ESPERA", "20"))   # piso da pausa
-ESPERA_MAX = int(os.environ.get("EQUATORIAL_ESPERA_MAX", "45"))  # teto da pausa
-PRAZO = int(os.environ.get("EQUATORIAL_PRAZO", "21600"))       # desiste depois de 6h
-DWELL = int(os.environ.get("EQUATORIAL_DWELL", "40"))  # permanencia antes de preencher
+# OBSOLETOS no fluxo do orquestrador.py, mantidos porque baixar_fatura.coletar()
+# e o coletar.ps1 (caminho de UC unica e imediata) ainda os leem.
+#
+# Eles vem da premissa antiga - "a recusa e independente entre tentativas, entao
+# vale metralhar" -, que o teste manual derrubou: um login deu certo e o
+# seguinte, mesmo navegador e mesmo IP, foi recusado. Repetir a cada 20-45s nao
+# aumenta a chance, alimenta a contagem de velocity. No fluxo novo quem manda e
+# agenda.BACKOFF_H, em horas.
+ESPERA_BASE = int(os.environ.get("EQUATORIAL_ESPERA", "20"))
+ESPERA_MAX = int(os.environ.get("EQUATORIAL_ESPERA_MAX", "45"))
+PRAZO = int(os.environ.get("EQUATORIAL_PRAZO", "21600"))
+# Fallback de permanencia: so vale quando nao ha persona. Com persona, o tempo
+# vem de persona.dwell_base, que e estavel para aquele dispositivo.
+DWELL = int(os.environ.get("EQUATORIAL_DWELL", "40"))
 ROTACIONAR = os.environ.get("EQUATORIAL_ROTACIONAR", "0") == "1"
 DOMINIO = "goias.equatorialenergia.com.br"
 
@@ -60,30 +73,66 @@ def log(msg):
     print(f"[{time.strftime('%H:%M:%S')}] {msg}", flush=True)
 
 
-def digitar(page, seletor, texto):
-    """Digita tecla por tecla.
+def texto_da_pagina(page):
+    """innerText do body, ou "" se ainda nao ha body.
+
+    document.body e null em about:blank, em chrome-error:// e no intervalo entre
+    o commit da navegacao e o parse do HTML. Ler direto dali estoura com
+    "Cannot read properties of null" em momentos que sao normais, sobretudo logo
+    depois de uma troca de IP.
+    """
+    try:
+        return page.evaluate("document.body ? document.body.innerText : ''") or ""
+    except Exception:
+        return ""
+
+
+def digitar(page, seletor, texto, persona=None):
+    """Digita tecla por tecla, no ritmo da persona.
 
     Obrigatorio: os dois campos tem onpaste="return false" e aplicam mascara via
     onkeypress/onkeydown. page.fill() escreve direto no DOM sem disparar esses
     eventos, entao a mascara nao roda e a validacao do site falha.
+
+    O ritmo vem da persona (personas.py) e nao de um sorteio novo a cada
+    execucao. Um dispositivo cujo dono digita a 100ms/tecla hoje e a 200ms
+    amanha e menos plausivel que um que digita sempre parecido: a biometria de
+    digitacao do Transmit compara justamente com o historico do proprio device
+    ID, entao consistencia vale mais que lentidao.
     """
+    base = persona.tecla_ms if persona else 115
+    desvio = persona.tecla_desvio if persona else 55
+    taxa_erro = persona.taxa_erro if persona else 0.0
+
     campo = page.locator(seletor)
     campo.scroll_into_view_if_needed()
     caixa = campo.bounding_box()
-    if caixa:  # move o mouse ate o campo em vez de teleportar o cursor
-        page.mouse.move(
-            caixa["x"] + caixa["width"] * random.uniform(0.2, 0.8),
-            caixa["y"] + caixa["height"] * random.uniform(0.3, 0.7),
-            steps=random.randint(8, 20),
-        )
-    campo.click()
-    page.wait_for_timeout(random.randint(120, 350))
-    for ch in texto:
-        page.keyboard.type(ch, delay=random.randint(60, 170))
+    if caixa:  # caminho curvo ate o campo, nao teletransporte do cursor
+        x, y = H.alvo_no_elemento(caixa)
+        H.mover(page, x, y, persona)
+        H.pensar(page, persona, 0.3, 0.5)
+        page.mouse.click(x, y, delay=random.randint(45, 120))
+    else:
+        campo.click()
+    H.pensar(page, persona, 0.35, 0.5)
+    for i, ch in enumerate(texto):
+        # Erro e correcao: humano digitando numero longo troca digito e apaga.
+        # So faz sentido em campo numerico, entao sorteamos outro digito.
+        if taxa_erro and i > 1 and random.random() < taxa_erro:
+            errado = random.choice([d for d in "0123456789" if d != ch])
+            page.keyboard.type(errado, delay=max(40, int(random.gauss(base, desvio))))
+            page.wait_for_timeout(random.randint(180, 600))  # percebe o erro
+            page.keyboard.press("Backspace")
+            page.wait_for_timeout(random.randint(120, 400))
+        atraso = max(40, int(random.gauss(base, desvio)))
+        # Pausa maior nas fronteiras da mascara, onde o olho confere o campo.
+        if i and i % 3 == 0 and random.random() < 0.25:
+            atraso += random.randint(150, 700)
+        page.keyboard.type(ch, delay=atraso)
     page.wait_for_timeout(random.randint(200, 500))
 
 
-def permanecer(page, segundos):
+def permanecer(page, segundos=None, persona=None):
     """Fica na pagina interagindo, como um usuario que acabou de chegar.
 
     Nao e teatro: reCAPTCHA v3 e o DRS do Transmit pontuam tempo de permanencia
@@ -91,23 +140,10 @@ def permanecer(page, segundos):
     movimento de mouse, e um padrao de bot ainda que o fingerprint do navegador
     seja perfeito.
     """
-    fim = time.time() + segundos
-    largura = page.viewport_size["width"] if page.viewport_size else 1280
-    altura = page.viewport_size["height"] if page.viewport_size else 800
-    while time.time() < fim:
-        acao = random.random()
-        if acao < 0.45:
-            page.mouse.move(
-                random.randint(60, largura - 60),
-                random.randint(60, altura - 60),
-                steps=random.randint(10, 30),
-            )
-        elif acao < 0.75:
-            page.mouse.wheel(0, random.randint(-260, 320))
-        page.wait_for_timeout(random.randint(700, 2200))
+    return H.ler(page, persona, segundos=segundos)
 
 
-def aquecer(page):
+def aquecer(page, persona=None):
     """Navega um pouco pelo site antes de ir ao login.
 
     Aterrissar direto em LoginGO.aspx, submeter e sumir e um padrao pobre de
@@ -119,19 +155,24 @@ def aquecer(page):
     try:
         log("Aquecendo a sessao pela home")
         page.goto(URL_HOME, wait_until="domcontentloaded", timeout=45_000)
-        permanecer(page, random.randint(6, 12))
+        H.entre_telas(page, persona)
+        permanecer(page, H.pausa_s(9, 0.5, teto=45), persona)
 
         # segue um link interno qualquer, como quem estava navegando
-        internos = page.evaluate("""() => [...document.querySelectorAll('a')]
-            .map(a => a.href)
-            .filter(h => h && h.includes('equatorialenergia.com.br')
-                      && !/Login|logout|sair/i.test(h))
-            .slice(0, 40)""")
-        if internos:
+        passos = persona.passos_aquecimento if persona else 1
+        for _ in range(passos):
+            internos = page.evaluate("""() => [...document.querySelectorAll('a')]
+                .map(a => a.href)
+                .filter(h => h && h.includes('equatorialenergia.com.br')
+                          && !/Login|logout|sair/i.test(h))
+                .slice(0, 40)""")
+            if not internos:
+                break
             destino = random.choice(internos)
             log(f"Visitando {destino[:70]}")
             page.goto(destino, wait_until="domcontentloaded", timeout=45_000)
-            permanecer(page, random.randint(5, 10))
+            H.entre_telas(page, persona)
+            permanecer(page, H.pausa_s(8, 0.55, teto=40), persona)
     except PWTimeout:
         log("Aquecimento incompleto (timeout); seguindo para o login")
     except Exception as e:
@@ -217,7 +258,7 @@ def renovar_recaptcha(page):
     )
 
 
-def submeter(page):
+def submeter(page, persona=None):
     """Clica em Entrar e garante que o postback saia.
 
     Caminho primario: o botao real, que executa ValidarCamposAreaLogada ->
@@ -227,7 +268,7 @@ def submeter(page):
     Fallback: se o token nao aparecer, refaz o que a pagina faria - com o .catch()
     que ela nao tem - e dispara o postback.
     """
-    page.click(SEL_ENTRAR)
+    H.clicar(page.locator(SEL_ENTRAR).first, page, persona)
     try:
         page.wait_for_function(
             f"document.querySelector('{SEL_TK_TRANSMIT}')?.value?.length > 0",
@@ -258,6 +299,43 @@ def submeter(page):
     return "fallback"
 
 
+def esperar_postback(page, pronto=None, timeout_s=45, rotulo="postback"):
+    """Espera o postback do WebForms entregar a tela nova. Devolve os segundos.
+
+    Substitui wait_for_load_state("networkidle"), que era o maior desperdicio do
+    ciclo: a pagina carrega Imperva, reCAPTCHA v3 e Transmit, e os tres mantem
+    beacon periodico, entao a rede nunca fica ociosa por 500ms seguidos e o
+    networkidle so entregava o timeout inteiro - 45s por UC sem nada em troca.
+
+    O que interessa nao e a rede parar, e o conteudo novo aparecer. `pronto` e
+    um predicado sem argumentos que responde isso; sem ele esperamos so o
+    documento carregar. O tempo gasto vai para o log porque e a unica forma de
+    ver, numa corrida real, se a espera esta dimensionada.
+
+    Esperar nao e um sinal que o site observe: quem nos ve e a telemetria de
+    interacao, e ela vem das pausas de humano.py, que continuam intactas.
+    """
+    inicio = time.time()
+    try:
+        page.wait_for_load_state("domcontentloaded", timeout=timeout_s * 1000)
+    except PWTimeout:
+        pass
+    if pronto is not None:
+        limite = inicio + timeout_s
+        while time.time() < limite:
+            try:
+                if pronto():
+                    break
+            except Exception:
+                # Documento trocando debaixo dos pes no meio do postback: nao e
+                # resposta, so tentar de novo no proximo giro.
+                pass
+            page.wait_for_timeout(250)
+    gasto = time.time() - inicio
+    log(f"({rotulo} respondeu em {gasto:.1f}s)")
+    return gasto
+
+
 def area_logada(page, timeout_s=20):
     """Confirma autenticacao pelo que so existe na area logada.
 
@@ -268,15 +346,24 @@ def area_logada(page, timeout_s=20):
     """
     limite = time.time() + timeout_s
     while time.time() < limite:
-        if page.locator(SEL_UC).count() == 0 and page.locator(SEL_DATA).count() == 0:
-            texto = page.evaluate("document.body.innerText || ''")
-            if "Sair" in texto and ("Meus dados" in texto or "Fornecimento" in texto):
-                return True
-        page.wait_for_timeout(1000)
+        try:
+            if page.locator(SEL_UC).count() == 0 and page.locator(SEL_DATA).count() == 0:
+                texto = texto_da_pagina(page)
+                if "Sair" in texto and ("Meus dados" in texto or "Fornecimento" in texto):
+                    return True
+        except Exception as e:
+            # Documento trocando debaixo dos pes (postback, erro de rede,
+            # redirect). Nao e resposta sobre estar logado ou nao - so tentar de
+            # novo no proximo giro.
+            log(f"(area_logada: pagina instavel, {str(e)[:60]})")
+        # 300ms e nao 1s: o menu da area logada leva uns segundos para montar, e
+        # cada giro perdido aqui e tempo de relogio no caminho critico de toda
+        # UC. O custo de olhar mais vezes e nulo - e leitura do DOM local.
+        page.wait_for_timeout(300)
     return False
 
 
-def etapa2(page, dialogos):
+def etapa2(page, dialogos, persona=None):
     """Segunda etapa: data de nascimento do titular.
 
     Bem mais simples que a primeira - sem Transmit, sem mascara JS. So o campo
@@ -288,17 +375,19 @@ def etapa2(page, dialogos):
         return False
 
     log("Preenchendo data de nascimento")
-    digitar(page, SEL_DATA, NASC)
+    digitar(page, SEL_DATA, NASC, persona)
     valor = page.input_value(SEL_DATA)
     log(f"Data no campo: {valor}")
 
     log(f"reCAPTCHA v3 (etapa 2): {renovar_recaptcha(page)}")
-    page.click(SEL_VALIDAR)
+    H.clicar(page.locator(SEL_VALIDAR).first, page, persona)
 
-    try:
-        page.wait_for_load_state("networkidle", timeout=45_000)
-    except PWTimeout:
-        pass
+    # Pronto = o campo de data sumiu (a etapa passou) ou o site gritou por
+    # alert(). Qualquer um dos dois encerra a espera; nao ha terceiro desfecho.
+    esperar_postback(
+        page,
+        lambda: bool(dialogos) or page.locator(SEL_DATA).count() == 0,
+        rotulo="etapa 2")
     page.wait_for_timeout(3000)
     return not dialogos
 
@@ -331,36 +420,143 @@ def escutar_dialogos(page):
     return dialogos
 
 
-def uma_tentativa_de_login(page, dialogos):
+def classificar_falha(page, dialogos):
+    """Diz POR QUE a tentativa falhou. O motivo determina o castigo.
+
+    Sem isso tudo virava "recusa" e recebia a mesma pausa de 20-45s - inclusive
+    o challenge do Imperva, onde insistir e a pior acao possivel, e o timeout de
+    rede, onde nao ha nada a punir. agenda.py aplica backoff por motivo:
+    minutos para 'rede', horas para 'backend', dias para 'imperva'.
+    """
+    msg = " ".join(dialogos)[:400]
+    corpo = texto_da_pagina(page)[:4000]
+    tudo = f"{msg} {corpo}"
+
+    if re.search(r"Incapsula|Request unsuccessful|_Incapsula_Resource"
+                 r"|Access Denied|Error code: 1[0-9]{2}", tudo, re.I):
+        return "imperva"
+    if re.search(r"#\s*0*\d+\s*-\s*N[aã]o foi poss[ií]vel realizar o login", tudo, re.I):
+        return "backend"
+    if re.search(r"captcha|rob[oô]|verifica[cç][aã]o de seguran[cç]a", tudo, re.I):
+        return "captcha"
+    if re.search(r"ERR_(NETWORK|INTERNET|CONNECTION|NAME_NOT|TIMED)", tudo, re.I):
+        return "rede"
+    if re.search(r"inv[aá]lid|incorret|n[aã]o (confere|localizada|encontrada)", tudo, re.I):
+        return "credencial"
+    return "desconhecido"
+
+
+# Um matcher so, usado tanto para localizar quanto para clicar: manter duas
+# copias da regra em strings JS separadas e o tipo de duplicacao que sai do ar
+# silenciosamente quando o site muda o rotulo do link.
+_JS_ACHADOS = """
+    const alvos = [...document.querySelectorAll(
+        'a, button, input[type=button], input[type=submit]')];
+    const casa = (el) => {
+        const t = ((el.innerText || el.value || '') + ' ' +
+                   (el.getAttribute('href') || '') + ' ' +
+                   (el.getAttribute('onclick') || '') + ' ' +
+                   (el.id || '') + ' ' + (el.title || '')).toLowerCase();
+        return /(^|[^a-z])sair([^a-z]|$)|logout|logoff|log_off|encerrar\\s*sess/.test(t);
+    };
+    const achados = alvos.filter(casa);
+"""
+
+ACHAR_SAIR = """() => {""" + _JS_ACHADOS + """
+    if (!achados.length) return null;
+    // Preferir o visivel: clicar nele gera a telemetria de um clique real.
+    const visivel = achados.find(el => el.offsetParent !== null);
+    const el = visivel || achados[0];
+    const c = el.getBoundingClientRect();
+    return {
+        visivel: !!visivel,
+        txt: (el.innerText || el.value || '').trim().slice(0, 40),
+        href: (el.getAttribute('href') || '').slice(0, 160),
+        caixa: visivel ? {x: c.x, y: c.y, width: c.width, height: c.height} : null,
+    };
+}"""
+
+
+def sair(page, persona=None):
+    """Encerra a sessao pelo proprio site.
+
+    Limpar cookie no cliente derruba a sessao aqui, mas nao no servidor: a
+    sessao ASP.NET fica pendurada ate expirar, e uma conta acumulando sessoes
+    abertas e um dos sinais mais baratos que existem. Deslogar tambem e o que um
+    cliente faz.
+
+    Nao da para usar Locator.click(): o "Sair" mora num menu de cabecalho que o
+    Playwright considera nao-acionavel, e a chamada gastava 30s ate estourar o
+    timeout sem deslogar nada. Entao: se o elemento estiver visivel, clique
+    humano normal; se nao, clique via JS, que ignora a heuristica de
+    acionabilidade. O sucesso e conferido pelo campo de UC voltar a existir -
+    ele so aparece deslogado.
+    """
+    try:
+        alvo = page.evaluate(ACHAR_SAIR)
+    except Exception as e:
+        log(f"(nao localizei o Sair: {str(e)[:60]})")
+        return False
+    if not alvo:
+        log("(link Sair nao encontrado na pagina)")
+        return False
+
+    try:
+        if alvo["visivel"] and alvo["caixa"]:
+            x, y = H.alvo_no_elemento(alvo["caixa"])
+            H.mover(page, x, y, persona)
+            H.pensar(page, persona, 0.5, 0.5)
+            page.mouse.click(x, y, delay=random.randint(45, 120))
+        else:
+            page.evaluate("() => {" + _JS_ACHADOS +
+                          "if (achados.length) achados[0].click(); }")
+        page.wait_for_selector(SEL_UC, timeout=15_000)
+        log(f"Sessao encerrada ({alvo['txt'] or alvo['href'] or 'Sair'})")
+        return True
+    except PWTimeout:
+        log("(cliquei em Sair mas a pagina de login nao voltou)")
+        return False
+    except Exception as e:
+        log(f"(nao consegui deslogar: {str(e)[:70]})")
+        return False
+
+
+def uma_tentativa_de_login(page, dialogos, persona=None):
     """Executa o fluxo de login uma vez. True se terminou na area logada."""
     dialogos.clear()
 
     # Sempre recarrega: reaproveitar a aba deixa campos preenchidos de uma
     # execucao anterior, e o maxlength esconde a duplicacao silenciosamente.
     if AQUECER:
-        aquecer(page)
+        aquecer(page, persona)
 
     ir_para(page, URL)
     page.bring_to_front()
     page.wait_for_selector(SEL_UC, timeout=30_000)
+    H.entre_telas(page, persona)
 
     if not esperar_transmit_pronto(page):
         log("AVISO: SDK do Transmit nao apareceu; seguindo assim mesmo")
 
-    permanecer(page, DWELL)
-    digitar(page, SEL_UC, UC)
-    digitar(page, SEL_DOC, DOC)
+    # Permanencia com base na persona, nao num numero fixo do modulo: cada
+    # dispositivo tem o proprio tempo tipico de leitura da pagina.
+    base = persona.dwell_base if persona else DWELL
+    permanecer(page, max(8, int(random.gauss(base, base * 0.25))))
+    digitar(page, SEL_UC, UC, persona)
+    digitar(page, SEL_DOC, DOC, persona)
     page.keyboard.press("Tab")  # dispara o onblur do campo de documento
-    page.wait_for_timeout(random.randint(400, 900))
+    H.pensar(page, persona, 0.7, 0.5)
+    H.talvez_distrair(page, persona)
 
     valor, corrigido = normalizar_documento(page, DOC)
     log(f"Documento: {valor}" + (" (separador corrigido)" if corrigido else ""))
     valor_uc = page.input_value(SEL_UC)
     if "".join(filter(str.isdigit, valor_uc)) != UC:
         sys.exit(f"UC inconsistente no campo: {valor_uc!r} (esperado {UC})")
-    permanecer(page, random.randint(4, 9))  # pausa antes de clicar Entrar
+    # Pausa antes de Entrar: a conferida final nos dois campos.
+    permanecer(page, H.pausa_s(6.5, 0.5, teto=30), persona)
     log(f"UC: {valor_uc} | reCAPTCHA: {renovar_recaptcha(page)}")
-    log(f"Submetendo (via {submeter(page)})")
+    log(f"Submetendo (via {submeter(page, persona)})")
 
     # Etapa 1 aceita: o site troca o formulario pelo campo de data de
     # nascimento. Mas a sessao ja esta autenticada nesse ponto, entao da para ir
@@ -374,6 +570,7 @@ def uma_tentativa_de_login(page, dialogos):
             return False
         log("Campo de data nao apareceu, mas tambem nao houve alerta")
 
+    H.entre_telas(page, persona, mediana=3.0)
     ir_para(page, URL_FATURAS)
     if area_logada(page):
         return True
@@ -382,7 +579,7 @@ def uma_tentativa_de_login(page, dialogos):
     try:
         page.go_back(wait_until="domcontentloaded")
         page.wait_for_selector(SEL_DATA, timeout=20_000)
-        etapa2(page, dialogos)
+        etapa2(page, dialogos, persona)
         ir_para(page, URL_FATURAS)
         return area_logada(page)
     except PWTimeout:
@@ -399,11 +596,26 @@ def preparar_rede():
     """
     if not ROTACIONAR:
         return None
+    if os.environ.get("EQUATORIAL_PROXY"):
+        # Este processo ja sai por um adaptador escolhido a dedo (o SOCKS do
+        # coletar_paralelo.py amarra o socket). Tomar a rota padrao aqui daria a
+        # maquina inteira a UM celular, e os outros workers continuariam certos
+        # so por sorte do roteamento.
+        log("Saida por proxy amarrado; nao mexo na rota padrao")
+        return None
     import rede
 
     tether = rede.detectar_tether()
     log(f"Tethering: {tether['nome']} ({tether['descricao']})")
-    estado = rede.assumir_rota(tether["ifIndex"])
+    try:
+        estado = rede.assumir_rota(tether["ifIndex"])
+    except RuntimeError as e:
+        # assumir_rota (metrica 1) exige admin. Sem elevacao, seguimos se o
+        # trafego ja sai pelo tether - o adaptador USB costuma ter metrica
+        # automatica menor que o Wi-Fi, virando rota padrao sozinho. A rotacao
+        # de IP em si (adb) nao precisa de admin.
+        log(f"Sem gerenciar a rota ({str(e)[:70]})")
+        estado = None
     log(f"Saindo pelo IP {rede.ip_publico()}")
     return estado
 
@@ -464,55 +676,82 @@ def trocar_ip(page, ctx):
     return depois != antes
 
 
-def garantir_login(page, dialogos, ctx=None, prazo_s=PRAZO):
-    """Insiste ate entrar na area logada, com pausa curta entre tentativas.
+def tentar_login(page, dialogos, persona=None, sessao_possivel=True):
+    """UMA passada pelo fluxo de login. Devolve (ok, motivo).
 
-    O backend recusa de forma intermitente com "#00N - Nao foi possivel realizar
-    o login neste momento": mesmas credenciais e mesmo codigo ora passam, ora
-    nao - e o login manual humano tambem apanha disso. Como a chance de sucesso
-    e independente a cada tentativa, o que paga e tentar muitas vezes rapido,
-    nao esperar mais entre elas.
+    `sessao_possivel=False` pula a sonda de sessao anterior. Vale sempre que
+    quem chama sabe que nao ha sessao a herdar - Chrome recem-subido cujo ultimo
+    login foi ha mais de 20 min, que e o caso normal do orquestrador. A sonda
+    custava um page load mais os 8s do laco de area_logada em TODA UC para
+    descobrir o que ja se sabia. Pular tambem melhora o percurso: sem ela a
+    sessao comeca pela home (aquecer), como um visitante, em vez de bater
+    deslogado numa URL de area logada.
 
-    Com EQUATORIAL_ROTACIONAR=1, cada recusa tambem troca o IP do celular
-    (ver rede.py). Expectativa modesta: sob CGNAT o IP novo tende a sair do
-    mesmo pool/ASN que o site ja pontuou.
+    Por que uma so, e nao o laco de 6h que existia aqui: o laco antigo partia da
+    hipotese de que as recusas eram independentes, entao metralhar pagava. O
+    teste manual mostrou o contrario - um login deu certo e o seguinte, mesmo
+    navegador e mesmo IP, foi recusado; a mesma UC entrou de primeira em outro
+    dispositivo. Se as tentativas nao sao independentes, repetir rapido nao
+    aumenta a chance: reduz, porque cada repeticao alimenta a contagem de
+    velocity que gerou o bloqueio.
+
+    Quem decide se e quando repetir e a agenda.py, em escala de horas ou dias,
+    com backoff por motivo. Este modulo so faz a tentativa e diz o que houve.
     """
-    log("Verificando se a sessao anterior ainda vale")
-    ir_para(page, URL_FATURAS)
-    if area_logada(page, timeout_s=8):
-        log("Sessao ainda valida - login desnecessario")
-        return True
+    if sessao_possivel:
+        log("Verificando se a sessao anterior ainda vale")
+        ir_para(page, URL_FATURAS)
+        if area_logada(page, timeout_s=8):
+            log("Sessao ainda valida - login desnecessario")
+            return True, "sessao"
 
-    limite = time.time() + prazo_s
-    tentativa = 0
-    while time.time() < limite:
-        tentativa += 1
-        log(f"--- Tentativa de login {tentativa} ---")
-        try:
-            if uma_tentativa_de_login(page, dialogos):
-                titular = page.evaluate(
-                    r"""() => {
-                        const m = document.body.innerText.match(
-                            /^\s*([A-ZÁÂÃÀÉÊÍÓÔÕÚÇ][A-ZÁÂÃÀÉÊÍÓÔÕÚÇ ]{6,60})\s*$/m);
-                        return m ? m[1].trim() : null;
-                    }"""
-                )
-                log(f"Login OK{f' - {titular}' if titular else ''} (tentativa {tentativa})")
-                return True
-        except PWTimeout as e:
-            log(f"Timeout na tentativa {tentativa}: {str(e)[:90]}")
+    try:
+        if uma_tentativa_de_login(page, dialogos, persona):
+            achado = re.search(
+                r"^\s*([A-ZÁÂÃÀÉÊÍÓÔÕÚÇ][A-ZÁÂÃÀÉÊÍÓÔÕÚÇ ]{6,60})\s*$",
+                texto_da_pagina(page), re.M)
+            titular = achado.group(1).strip() if achado else None
+            log(f"Login OK{f' - {titular}' if titular else ''}")
+            return True, "ok"
+    except PWTimeout as e:
+        log(f"Timeout no login: {str(e)[:90]}")
+        dialogos.append(str(e)[:200])
+    except Exception as e:
+        log(f"Erro no login: {type(e).__name__}: {str(e)[:90]}")
+        dialogos.append(f"{type(e).__name__}: {str(e)[:200]}")
 
-        if ROTACIONAR:
-            trocar_ip(page, ctx)
+    motivo = classificar_falha(page, dialogos)
+    log(f"Login recusado - motivo classificado: {motivo}")
+    return False, motivo
 
-        espera = random.randint(ESPERA_BASE, ESPERA_MAX)
-        if time.time() + espera > limite:
-            break
-        log(f"Aguardando {espera}s antes da proxima tentativa")
+
+# Quantas passadas por execucao. 1 e o padrao e o recomendado; 2 so faz sentido
+# quando o motivo da primeira foi 'rede' (nao houve recusa, houve queda).
+TENTATIVAS = int(os.environ.get("EQUATORIAL_TENTATIVAS", "1"))
+
+
+def garantir_login(page, dialogos, ctx=None, prazo_s=PRAZO, persona=None):
+    """Compatibilidade: chama tentar_login e devolve so o booleano.
+
+    Mantida para baixar_fatura.py e coletar_varias.py continuarem funcionando.
+    Note que ela NAO insiste mais por horas - retenta no maximo TENTATIVAS
+    vezes, e so quando a falha foi de rede.
+    """
+    global ULTIMO_MOTIVO
+    for n in range(1, max(1, TENTATIVAS) + 1):
+        ok, motivo = tentar_login(page, dialogos, persona)
+        ULTIMO_MOTIVO = motivo
+        if ok:
+            return True
+        if motivo != "rede" or n == TENTATIVAS:
+            return False
+        espera = random.randint(45, 120)
+        log(f"Falha de rede; nova passada em {espera}s ({n + 1}/{TENTATIVAS})")
         page.wait_for_timeout(espera * 1000)
-
-    log(f"Prazo de {prazo_s}s esgotado sem conseguir logar")
     return False
+
+
+ULTIMO_MOTIVO = None
 
 
 def main():

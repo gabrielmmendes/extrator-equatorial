@@ -5,3 +5,7 @@ faturas/
 *.pdf
 .venv/
 __pycache__/
+perfis/
+estado/
+contas.json
+logs/

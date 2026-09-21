@@ -1,5 +1,14 @@
 #!/usr/bin/env python3
-"""Baixa a fatura mais recente de varias UCs (contas diferentes) numa tacada.
+"""SUBSTITUIDO por orquestrador.py - mantido so como referencia.
+
+O problema deste arquivo nao e de implementacao, e de premissa: ele roda as
+UCs em sequencia, no MESMO perfil de Chrome, trocando de conta com
+clear_cookies(). Isso deixa localStorage/IndexedDB intactos, entao o device
+ID do Transmit e o mesmo para todos os CPFs - varias contas diferentes
+entrando do mesmo dispositivo em poucos minutos, que e a regra de velocity
+mais basica que existe. Use orquestrador.py.
+
+Baixa a fatura mais recente de varias UCs (contas diferentes) numa tacada.
 
 Cada UC aqui pertence a um CPF/CNPJ distinto, entao sao logins separados: antes
 de cada uma limpamos os cookies do dominio para derrubar a sessao ASP.NET da
@@ -26,7 +35,7 @@ import baixar_fatura as bf
 
 # (UC, documento) - so digitos entram; o resto e ignorado
 CONTAS = [
-    ("000408683001277", "311.091.791-20"),
+    # ("000408683001277", "311.091.791-20"),  # UC 1: ja baixada, pulada
     ("000176588701258", "213.001.191-87"),
     ("000422143201201", "24.830.879/0001-67"),
     ("000090076001290", "760.823.001-06"),
@@ -38,6 +47,10 @@ PRAZO_POR_UC = int(__import__("os").environ.get("EQUATORIAL_PRAZO", "600"))
 
 def so_digitos(s):
     return "".join(filter(str.isdigit, s))
+
+
+# (mes, ano) pedido por EQUATORIAL_MES; None = a fatura mais recente.
+MES_ALVO = bf.mes_do_ambiente()
 
 
 def coletar_uc(page, ctx, dialogos, uc, doc):
@@ -60,8 +73,9 @@ def coletar_uc(page, ctx, dialogos, uc, doc):
 
     ir_para(page, URL_FATURAS)
     page.wait_for_timeout(2000)
+    mes, ano_pedido = MES_ALVO if MES_ALVO else (None, None)
     try:
-        ano = bf.consultar(page)
+        ano = bf.consultar(page, ano_alvo=ano_pedido)
     except PWTimeout as e:
         log(f"UC {uc}: timeout na consulta ({str(e)[:70]})")
         return None
@@ -69,7 +83,7 @@ def coletar_uc(page, ctx, dialogos, uc, doc):
         log(f"UC {uc}: nenhuma fatura encontrada")
         return None
 
-    caminho = bf.baixar_mais_recente(page, ctx, ano)
+    caminho = bf.baixar_mais_recente(page, ctx, ano, mes=mes)
     if not (caminho and caminho.exists() and caminho.stat().st_size > 1000):
         log(f"UC {uc}: consulta OK mas o download nao veio")
         return None
@@ -87,6 +101,8 @@ def coletar_uc(page, ctx, dialogos, uc, doc):
 
 def main():
     bf.FATURAS.mkdir(exist_ok=True)
+    if MES_ALVO:
+        log(f"Mes pedido: {MES_ALVO[0]:02d}/{MES_ALVO[1]}")
     resultados = {}
     # Rota no celular so com EQUATORIAL_ROTACIONAR=1; o finally garante que a
     # maquina nao fique roteando pelo 4G depois. Assumimos a rota uma vez para
