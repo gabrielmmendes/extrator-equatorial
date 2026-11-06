@@ -153,14 +153,20 @@ def linhas_pendentes(page):
     }""")
 
 
-def emitir(page, ctx, persona=None, mes=None, ano=None, nome=None):
-    """Clica Emitir, escolhe a fatura no grid e traz o PDF. (caminho|None, motivo)."""
+def emitir_grid(page, persona=None):
+    """Clica Emitir e devolve (linhas, motivo) do grid de pendentes.
+
+    motivo: "ok" (linhas nao vazias), "sem_fatura" (o site disse que nao ha
+    nenhuma) ou "falhou". Nao baixa nada: o grid fica na tela e cada linha pode
+    ser baixada depois com baixar_linha() - o download abre em aba propria, entao
+    a pagina do grid continua de pe para a linha seguinte.
+    """
     bf.FATURAS.mkdir(exist_ok=True)
 
     botao = page.locator(SEL_EMITIR).first
     if botao.count() == 0:
         log("Segunda via: botao Emitir nao encontrado")
-        return None, "falhou"
+        return [], "falhou"
     # Ninguem preenche tres selects e clica no mesmo instante.
     H.ler(page, persona, segundos=H.pausa_s(4.0, 0.5, teto=20))
     H.clicar(botao, page, persona)
@@ -179,34 +185,104 @@ def emitir(page, ctx, persona=None, mes=None, ano=None, nome=None):
         achado = RE_SEM_FATURA.search(texto_da_pagina(page))
         if achado:
             log(f"Segunda via: {achado.group(0).strip()[:120]}")
-            return None, "sem_fatura"
+            return [], "sem_fatura"
         log("Segunda via: o Emitir nao devolveu grid nem aviso - veja "
             "estrutura-segundavia-emissao.json")
-        return None, "falhou"
+        return [], "falhou"
 
     log(f"Segunda via: {len(linhas)} fatura(s) pendente(s): "
         + " | ".join(l["rotulo"][:40] for l in linhas))
-    if mes and ano:
-        alvo = next((l for l in linhas
-                     if mes_do_rotulo(l["rotulo"]) == (int(mes), int(ano))), None)
-        if not alvo:
-            log(f"Segunda via: {mes:02d}/{ano} nao esta entre as pendentes")
-            return None, "mes_ausente"
-    else:
-        # A mais recente pela competencia. Linha sem "MMM/AAAA" legivel fica por
-        # ultimo, mas nao e descartada: sem nenhuma outra, ela e a resposta.
-        alvo = max(linhas, key=lambda l: mes_do_rotulo(l["rotulo"]) or (0, 0))
+    return linhas, "ok"
 
-    ref = mes_do_rotulo(alvo["rotulo"])
+
+def _ordem(linha):
+    """Chave de ordenacao por competencia: (ano, mes). Sem competencia, (0, 0).
+
+    mes_do_rotulo devolve (mes, ano); comparar essa tupla crua punha DEZ/2025
+    acima de JAN/2026 e fazia "a mais recente" sair do ano errado.
+    """
+    ref = mes_do_rotulo(linha["rotulo"])
+    return (ref[1], ref[0]) if ref else (0, 0)
+
+
+def escolher_pendente(linhas, mes=None, ano=None, mais_antiga=False):
+    """A linha do grid a baixar, ou None.
+
+    Com mes/ano, so aquela competencia. Sem eles, a mais recente pela
+    competencia - ou a mais antiga, com `mais_antiga`. Linha sem "MMM/AAAA"
+    legivel fica por ultimo, mas nao e descartada: sem nenhuma outra, ela e a
+    resposta.
+    """
+    if not linhas:
+        return None
+    if mes and ano:
+        return next((l for l in linhas
+                     if mes_do_rotulo(l["rotulo"]) == (int(mes), int(ano))), None)
+    if mais_antiga:
+        datadas = [l for l in linhas if mes_do_rotulo(l["rotulo"])]
+        return min(datadas, key=_ordem) if datadas else linhas[0]
+    return max(linhas, key=_ordem)
+
+
+def baixar_linha(page, ctx, linha, persona=None, nome=None):
+    """Baixa o PDF de uma linha do grid de pendentes. Devolve o caminho ou None."""
+    ref = mes_do_rotulo(linha["rotulo"])
     if not nome:
         nome = f"fatura-{ref[0]}-{ref[1]}.pdf" if ref else "fatura-2via.pdf"
-    log(f"Segunda via: baixando {alvo['rotulo'][:70]!r} (invoice={alvo['invoice']})")
+    log(f"Segunda via: baixando {linha['rotulo'][:70]!r} (invoice={linha['invoice']})")
     # Olhar o grid antes de clicar no download da linha certa.
     H.ler(page, persona, segundos=H.pausa_s(4.0, 0.5, teto=20))
-    caminho = bf.baixar_espelho(ctx, alvo["invoice"], nome, persona, base_url=URL_PDF)
+    caminho = bf.baixar_espelho(ctx, linha["invoice"], nome, persona, base_url=URL_PDF)
     if caminho and caminho.exists() and caminho.stat().st_size > 1000:
-        return caminho, "ok"
-    return None, "falhou"
+        return caminho
+    return None
+
+
+def emitir(page, ctx, persona=None, mes=None, ano=None, nome=None, mais_antiga=False):
+    """Clica Emitir, escolhe a fatura no grid e traz o PDF. (caminho|None, motivo)."""
+    linhas, motivo = emitir_grid(page, persona)
+    if not linhas:
+        return None, motivo
+    alvo = escolher_pendente(linhas, mes, ano, mais_antiga)
+    if not alvo:
+        log(f"Segunda via: {mes:02d}/{ano} nao esta entre as pendentes")
+        return None, "mes_ausente"
+    caminho = baixar_linha(page, ctx, alvo, persona, nome)
+    return (caminho, "ok") if caminho else (None, "falhou")
+
+
+def abrir(page, uc, persona=None):
+    """Abre a SegundaVia.aspx e preenche UC, tipo e motivo, sem emitir.
+
+    Devolve None quando o formulario esta pronto para o Emitir, ou o motivo da
+    falha: "login" (a pagina nao carregou o formulario - sessao caida),
+    "uc_ausente" (a UC nao esta no combo do titular) ou "falhou".
+    """
+    ir_para(page, URL)
+    try:
+        page.wait_for_selector(SEL_UC, timeout=20_000)
+    except PWTimeout:
+        pass
+    if not na_pagina(page):
+        log(f"Segunda via: a pagina nao carregou o formulario (url={page.url[:90]})")
+        bf.dump_estrutura(page, "segundavia-form")
+        return "login"
+
+    H.entre_telas(page, persona, mediana=2.8)
+    digitos = "".join(filter(str.isdigit, str(uc)))
+    valor = next((v for v, _ in _opcoes(page, SEL_UC)
+                  if "".join(filter(str.isdigit, v)) == digitos), None)
+    if valor is None:
+        disp = ", ".join(v for v, _ in _opcoes(page, SEL_UC) if v)[:200]
+        log(f"Segunda via: UC {uc} nao esta no combo do titular. Ha: {disp}")
+        return "uc_ausente"
+    if escolher(page, SEL_UC, valor, persona, "UC") is None:
+        return "falhou"
+    if escolher(page, SEL_TIPO, RE_TIPO, persona, "tipo de emissao") is None:
+        return "falhou"
+    if escolher(page, SEL_MOTIVO, RE_MOTIVO, persona, "motivo") is None:
+        return "falhou"
+    return None
 
 
 def tentar(page, ctx, uc, persona=None, mes=None, ano=None, nome=None):
@@ -218,31 +294,9 @@ def tentar(page, ctx, uc, persona=None, mes=None, ano=None, nome=None):
     Com mes/ano, so baixa se aquela competencia estiver entre as pendentes: o
     que ja foi pago nao aparece aqui, e ai o historico e que resolve.
     """
-    ir_para(page, URL)
-    try:
-        page.wait_for_selector(SEL_UC, timeout=20_000)
-    except PWTimeout:
-        pass
-    if not na_pagina(page):
-        log(f"Segunda via: a pagina nao carregou o formulario (url={page.url[:90]})")
-        bf.dump_estrutura(page, "segundavia-form")
-        return None, "login"
-
-    H.entre_telas(page, persona, mediana=2.8)
-    digitos = "".join(filter(str.isdigit, str(uc)))
-    valor = next((v for v, _ in _opcoes(page, SEL_UC)
-                  if "".join(filter(str.isdigit, v)) == digitos), None)
-    if valor is None:
-        disp = ", ".join(v for v, _ in _opcoes(page, SEL_UC) if v)[:200]
-        log(f"Segunda via: UC {uc} nao esta no combo do titular. Ha: {disp}")
-        return None, "uc_ausente"
-    if escolher(page, SEL_UC, valor, persona, "UC") is None:
-        return None, "falhou"
-    if escolher(page, SEL_TIPO, RE_TIPO, persona, "tipo de emissao") is None:
-        return None, "falhou"
-    if escolher(page, SEL_MOTIVO, RE_MOTIVO, persona, "motivo") is None:
-        return None, "falhou"
-
+    motivo = abrir(page, uc, persona)
+    if motivo:
+        return None, motivo
     return emitir(page, ctx, persona, mes=mes, ano=ano, nome=nome)
 
 

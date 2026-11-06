@@ -370,6 +370,30 @@ MATURACAO_MIN = max(0, int(os.environ.get("EQUATORIAL_MATURACAO_MIN", "30")))
 MATURACAO_MAX = max(MATURACAO_MIN, int(os.environ.get("EQUATORIAL_MATURACAO_MAX", "90")))
 
 
+def maturar_persona(persona):
+    """Sobe o perfil, da o passeio de maturacao e derruba. Nao loga em nada."""
+    rotacionar_ip()
+    pid, porta = nav.subir(persona)
+    pw = browser = None
+    try:
+        pw, browser, ctx, _ = conectar(porta)
+        nav.maturar(ctx, persona)
+    except Exception as e:
+        log(f"{persona.apelido}: maturacao falhou ({str(e)[:70]})")
+    finally:
+        try:
+            if browser:
+                browser.close()
+        except Exception:
+            pass
+        try:
+            if pw:
+                pw.stop()
+        except Exception:
+            pass
+        nav.derrubar(persona, porta, pid)
+
+
 def maturar_pendentes(contas, limite=None):
     """Prepara perfis que ainda nao navegaram nada. Nao loga em nada."""
     novos = [c for c in contas
@@ -381,27 +405,7 @@ def maturar_pendentes(contas, limite=None):
     novos = novos[:limite] if limite else novos
     log(f"Maturando {len(novos)} perfil(is)")
     for i, c in enumerate(novos):
-        persona = P.persona_de(c["doc"], c["apelido"])
-        rotacionar_ip()
-        pid, porta = nav.subir(persona)
-        pw = browser = None
-        try:
-            pw, browser, ctx, _ = conectar(porta)
-            nav.maturar(ctx, persona)
-        except Exception as e:
-            log(f"{c['apelido']}: maturacao falhou ({str(e)[:70]})")
-        finally:
-            try:
-                if browser:
-                    browser.close()
-            except Exception:
-                pass
-            try:
-                if pw:
-                    pw.stop()
-            except Exception:
-                pass
-            nav.derrubar(persona, porta, pid)
+        maturar_persona(P.persona_de(c["doc"], c["apelido"]))
         # Espaco entre perfis, mas nao depois do ultimo: quem chamou ja tem a
         # propria pausa, e dormir aqui no fim so atrasa o retorno.
         if i < len(novos) - 1:

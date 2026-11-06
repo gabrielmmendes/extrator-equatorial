@@ -80,6 +80,118 @@ Ainda **não relatamos resultado nem enviamos o PDF** de volta — a documentaç
 recebida cobre só o `/queues`. O `task_id`, o `uc_id` e o `id` de cada tarefa
 ficam guardados no cache para o dia em que esses endpoints entrarem.
 
+## Worker do gcenergy (`worker.py`)
+
+Modo em que a fila vem do gcenergy por HTTP, seguindo o guia de integração do
+worker: reserva um job (`POST /worker/jobs/reservar`), busca as faturas da UC,
+sobe cada PDF no Google Drive e devolve os IDs no `PATCH .../status`. O gcenergy
+importa em segundo plano; o worker não acompanha.
+
+```powershell
+.venv\Scripts\python.exe worker.py --checar   # chave da API + credencial do Drive, sem reservar nada
+.\robo.ps1 -Modo worker                       # laço contínuo
+.\robo.ps1 -Modo worker -Rotacionar           # idem, trocando o IP pelo celular
+.venv\Scripts\python.exe worker.py --uma      # no máximo uma reserva e sai
+.venv\Scripts\python.exe worker.py --job 42   # mostra um job, sem mexer nele
+```
+
+Precisa de `GCENERGY_WORKER_KEY` e `GOOGLE_DRIVE_CREDENCIAIS` no
+`credenciais.env`. A pasta do Drive (`GOOGLE_DRIVE_PASTA_ID`) precisa dar
+**leitura para a conta de serviço do gcenergy** — sem isso o job fecha
+`CONCLUIDO` e a importação falha do lado deles (aparece em `importacaoStatus`).
+
+### Um job por vez, e o ritmo continua sendo da agenda
+
+O job tem 60 min de prazo e chega numa ordem que o robô não escolhe. A
+estratégia de reputação não muda por isso; ela é aplicada em dois pontos:
+
+- **Antes de reservar**: janela de horário, intervalo e cooldown da agenda.
+  Fora deles o worker não reserva — o job espera `PENDENTE` no servidor, sem
+  relógio correndo. Não há teto diário de sessões no worker
+  (`EQUATORIAL_TETO_DIA` só vale no orquestrador).
+- **Depois de reservar, por UC**: em backoff de bloqueio, já com sessão hoje,
+  ou com o dispositivo do titular parado depois de um bloqueio → `ERRO`
+  `TENTATIVA_ADIADA`. O `motivoErro` diz até quando. Devolver `PENDENTE`
+  travaria a fila: ela é servida em ordem e o mesmo job voltaria na reserva
+  seguinte. Com `ERRO`, o cron diário recria o job amanhã — uma tentativa por
+  UC por dia, que é o ritmo do projeto.
+
+Mês que já está em `faturas/` (de qualquer fluxo) vai sem abrir o portal; job
+inteiro em disco conclui sem login. Num job `MESES`, a 2ª via é emitida uma vez
+e cada mês pendente sai do mesmo grid; o resto vem do histórico, uma consulta
+por ano. PDF já enviado não sobe de novo (`estado/drive_ids.json`).
+
+| Desfecho                                   | PATCH                                    |
+| ------------------------------------------ | ---------------------------------------- |
+| algum PDF (do disco ou do portal)          | `CONCLUIDO` com os IDs; parcial se faltou mês |
+| login barrado (Imperva, reCAPTCHA, #00x)   | `ERRO` `CAPTCHA`                          |
+| UC/documento recusados                     | `ERRO` `LOGIN_INVALIDO` / `UC_NAO_ENCONTRADA` |
+| portal pediu nascimento e o job não tem    | `ERRO` `DATA_NASCIMENTO_AUSENTE`          |
+| portal fora do ar, PDF que não veio        | `ERRO` `DISTRIBUIDORA_INDISPONIVEL`       |
+| logou e nenhum mês pedido tem fatura       | `ERRO` `FATURA_INDISPONIVEL`              |
+| falha do robô ou do upload no Drive        | `ERRO` `ERRO_INTERNO`                     |
+| `Ctrl+C` no meio do job                    | `PENDENTE` (volta para a fila)            |
+
+`409` no PATCH segue o guia: consulta o job e repete só se ele ainda é deste
+worker. Se o processo morrer com um job na mão, a próxima largada o devolve à
+fila (`estado/worker_job-<X-Worker-Id>.json`) em vez de esperar o timeout.
+
+### Pool de personas
+
+O worker **não** usa um perfil de Chrome por titular — com 1500+ titulares
+seriam 1500 perfis para maturar e um dia perdido a cada titular novo. Usa um
+**pool fixo** de `GCENERGY_PERSONAS` perfis (padrão 30, em `perfis/pool-NN`),
+e cada titular cai **sempre na mesma persona** (hash do CPF/CNPJ). Cada
+dispositivo atende um grupo estável de ~1500/30 = 50 contas, e cada conta vê um
+dispositivo só — o padrão de um escritório que cuida das contas de um grupo de
+clientes, e não o de um dispositivo rodando por centenas de contas.
+
+- **Primeira largada**: enquanto houver persona sem maturar, o worker matura
+  uma por vez (30–90 s entre elas) e não reserva nada; depois espera todas
+  terem a idade mínima (3–6 h). Com 3 celulares, ~20 min de maturação.
+- **Descanso**: a mesma persona só abre outra sessão depois de
+  `GCENERGY_PERSONA_DESCANSO_MIN` (padrão 15). Se o job cair numa persona
+  descansando, ele espera, dentro dos 60 min do servidor.
+- **Bloqueio marca o dispositivo**: `imperva`, `captcha` ou `#00x` param a
+  persona pela primeira faixa do backoff (3 h a 3 dias). Os jobs do grupo dela
+  terminam em `TENTATIVA_ADIADA` até lá. O IP já troca a cada sessão.
+- **Trava por persona** (`estado/travas/`): dois jobs na mesma persona — mesmo
+  titular ou mesmo grupo — rodam um depois do outro. O segundo espera, e se a
+  espera não couber no prazo, devolve `PENDENTE`. A trava é do processo:
+  worker morto não deixa persona travada.
+- Mudar `GCENERGY_PERSONAS` remapeia a maior parte dos titulares para outro
+  perfil. Escolha o tamanho uma vez.
+- Os perfis por titular já existentes em `perfis/` não são tocados: continuam
+  com o orquestrador antigo.
+
+
+### Um worker por celular (`worker_paralelo.py`)
+
+A conta que manda é sessão por dia: cada UC precisa de pelo menos uma por mês.
+Com margem de 40% para recusas, 1000 UCs pedem ~47 sessões/dia e 5000, ~230. Um
+worker só faz uma sessão por vez, saindo sempre pelo mesmo IP; a escala vem
+de IPs, não de pressa.
+
+```powershell
+.venv\Scripts\python.exe worker_paralelo.py --dispositivos   # confere os celulares
+.\robo.ps1 -Modo worker -Paralelo                            # um worker por celular
+```
+
+Cada celular vira um worker inteiro: proxy amarrado ao adaptador dele (mesma
+infraestrutura do `coletar_paralelo.py`), rotação de IP só dele,
+`X-Worker-Id` próprio (`<GCENERGY_WORKER_ID>-01`, `-02`...) e pasta de
+download própria. O pool de personas, `faturas/`, agenda e índice do Drive são
+compartilhados, com trava entre processos; na primeira largada os workers
+maturam o pool juntos, cada um pelo seu celular.
+
+- **Sem teto diário**: cada worker emenda um job no outro dentro da janela. O
+  que ainda segura o ritmo é o limite de uma sessão por UC por dia, o backoff
+  por motivo e a rotação de IP entre sessões. O limite seguro por IP não foi
+  medido (os únicos dados são 17 e 26 sessões/dia, em setembro): acompanhe a
+  taxa de `CAPTCHA` nos jobs.
+- **Parada**: `Ctrl+C` devolve os jobs em mãos; `estado/parar-worker.flag`
+  para todos entre um job e outro.
+
 ## Uso
 
 ```powershell
@@ -271,6 +383,9 @@ corporativa tem ligada.
 | `coletar_paralelo.py` | uma extração por celular, em paralelo, para um mês escolhido |
 | `historico_consumo.py` | histórico de consumo de uma lista em CSV, gravando em CSV |
 | `diagnostico.py`    | auditoria de fingerprint                                      |
+| `worker.py`         | worker do gcenergy: reserva job, busca, sobe no Drive, reporta |
+| `gcenergy.py`       | cliente HTTP das rotas `/worker/**` (reserva, GET, PATCH + 409) |
+| `worker_paralelo.py` | um worker do gcenergy por celular plugado                     |
 | `api.py`            | fila de UCs vinda da API do Minha Fatura                       |
 | `enviar_drive.py`   | sobe as faturas do mês para o Drive e gera o CSV `uc;mes;ano;link` |
 | `maturar_fila.py`   | matura só quem já está na fila local, sem buscar mais tarefas  |
@@ -289,7 +404,7 @@ corporativa tem ligada.
 | `EQUATORIAL_HORA_INICIO`    | 8      | início da janela de acesso         |
 | `EQUATORIAL_HORA_FIM`       | 22     | fim da janela                      |
 | `EQUATORIAL_TETO_UC_DIA`    | 1      | tentativas por UC por dia          |
-| `EQUATORIAL_TETO_DIA`       | 10     | teto global de logins por dia      |
+| `EQUATORIAL_TETO_DIA`       | 10     | teto global de logins por dia (só o orquestrador; o worker não tem) |
 | `EQUATORIAL_MATURACAO_H_MIN`| 3      | espera mínima antes do 1º login (h) |
 | `EQUATORIAL_MATURACAO_H_MAX`| 6      | espera máxima antes do 1º login (h) |
 | `EQUATORIAL_MATURACAO_MIN`  | 30     | pausa mínima entre perfis na maturação (s) |
@@ -309,6 +424,14 @@ corporativa tem ligada.
 | `EQUATORIAL_PORTA_BASE`     | 9222   | base da varredura de porta do CDP (uma por worker) |
 | `EQUATORIAL_LARGADA_MAX`    | 90     | atraso aleatório máximo na largada de cada worker (s) |
 | `EQUATORIAL_WEBRTC`         | 0      | `1` desliga a preferência que impede o WebRTC de vazar o IP do Wi-Fi |
+| `GCENERGY_WORKER_KEY`       | (vazio)| `X-Worker-Key` do worker do gcenergy |
+| `GCENERGY_URL`              | `https://api.synexsaas.com.br` | base da API do worker |
+| `GCENERGY_WORKER_ID`        | `robozin-<host>` | `X-Worker-Id`: fixo e único por instância |
+| `GCENERGY_PRAZO_MIN`        | 45     | busca por job antes de concluir com o que veio (o servidor corta em 60) |
+| `GCENERGY_ESPERA_VAZIA`     | 60     | segundos entre consultas com a fila vazia |
+| `GCENERGY_CACHE_LOCAL`      | 1      | `0` não reaproveita PDFs já em `faturas/` |
+| `GCENERGY_PERSONAS`         | 30     | tamanho do pool de personas do worker (mudar remapeia titulares) |
+| `GCENERGY_PERSONA_DESCANSO_MIN` | 15 | minutos entre duas sessões da mesma persona |
 | `GOOGLE_DRIVE_CREDENCIAIS`  | (vazio)| caminho do JSON de autorização do Google |
 | `GOOGLE_DRIVE_PASTA_ID`     | `1vligcM_szlS_R9SUqq03StdG-HX6FAOX` | pasta de destino no Drive |
 

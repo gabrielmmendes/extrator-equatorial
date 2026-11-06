@@ -172,17 +172,34 @@ def link_de(id_arquivo):
     return f"https://drive.google.com/file/d/{id_arquivo}/view"
 
 
-def enviar(servico, caminho, nome, pasta):
-    """Sobe um PDF com o nome do padrao da pasta e devolve o link."""
+def abrir_servico(json_cred):
+    """Cliente da API do Drive v3 a partir do JSON de autorizacao."""
+    from googleapiclient.discovery import build
+
+    return build("drive", "v3", credentials=credenciais(json_cred),
+                 cache_discovery=False)
+
+
+def subir(servico, caminho, nome, pasta):
+    """Sobe um PDF e devolve {"id", "webViewLink"} do files.create.
+
+    O `id` e o que o worker do gcenergy manda no CONCLUIDO: o servidor baixa o
+    arquivo por ele. Link de compartilhamento nao serve para isso.
+    """
     from googleapiclient.http import MediaFileUpload
 
     midia = MediaFileUpload(str(caminho), mimetype="application/pdf",
                             resumable=True)
-    arquivo = servico.files().create(
-        body={"name": nome, "parents": [pasta]},
+    return servico.files().create(
+        body={"name": nome, "parents": [pasta], "mimeType": "application/pdf"},
         media_body=midia, fields="id, webViewLink",
         supportsAllDrives=True,
-    ).execute()
+    ).execute(num_retries=3)
+
+
+def enviar(servico, caminho, nome, pasta):
+    """Sobe um PDF com o nome do padrao da pasta e devolve o link."""
+    arquivo = subir(servico, caminho, nome, pasta)
     return arquivo.get("webViewLink") or link_de(arquivo["id"])
 
 
@@ -232,11 +249,9 @@ def main():
         sys.exit("GOOGLE_DRIVE_CREDENCIAIS nao definida - aponte para o JSON "
                  "de autorizacao do Google em credenciais.env.")
 
-    from googleapiclient.discovery import build
     from googleapiclient.errors import HttpError
 
-    servico = build("drive", "v3", credentials=credenciais(json_cred),
-                    cache_discovery=False)
+    servico = abrir_servico(json_cred)
     try:
         existentes = ja_na_pasta(servico, args.pasta)
     except HttpError as e:

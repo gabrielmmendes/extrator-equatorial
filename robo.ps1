@@ -16,11 +16,17 @@ Uso:
     .\robo.ps1 -Modo maturar         # so prepara perfis novos
     .\robo.ps1 -Modo uma             # roda no maximo uma conta e sai
     .\robo.ps1 -Modo agora -Uc 000176588701258   # forca uma UC
+    .\robo.ps1 -Modo worker          # worker do gcenergy (fila de jobs por HTTP)
+    .\robo.ps1 -Modo worker -Rotacionar
+    .\robo.ps1 -Modo worker -Paralelo   # um worker por celular plugado
 #>
 [CmdletBinding()]
 param(
     [switch]$Rotacionar,
-    [ValidateSet('laco', 'uma', 'maturar', 'status', 'agora')]
+    # So com -Modo worker: um worker por celular (worker_paralelo.py). Cada um
+    # sai pelo proxy do proprio aparelho e rotaciona so o dele.
+    [switch]$Paralelo,
+    [ValidateSet('laco', 'uma', 'maturar', 'status', 'agora', 'worker')]
     [string]$Modo = 'laco',
     [string]$Uc,
     # Mes da fatura (MM/AAAA). Vazio = a mais recente. So vale com -Modo agora:
@@ -41,10 +47,26 @@ if (Test-Path $envFile) {
         }
     }
 }
+# No modo worker a fila e a do gcenergy (worker.py), que nao usa MF_API_KEY nem
+# contas.json: o que ele exige e a chave do worker e a credencial do Drive.
+if ($Modo -eq 'worker') {
+    if (-not $env:GCENERGY_WORKER_KEY) {
+        throw "Sem GCENERGY_WORKER_KEY em credenciais.env: o worker nao tem como reservar jobs."
+    }
+    if (-not $env:GOOGLE_DRIVE_CREDENCIAIS) {
+        throw "Sem GOOGLE_DRIVE_CREDENCIAIS em credenciais.env: o worker nao tem onde subir os PDFs."
+    }
+}
+if ($Paralelo -and $Modo -ne 'worker') { throw "-Paralelo so vale com -Modo worker" }
+if ($Paralelo -and $Rotacionar) {
+    # -Rotacionar poe a rota padrao da MAQUINA num celular; no paralelo cada
+    # worker sai pelo proxy do seu e a rota padrao tem de ficar no Wi-Fi.
+    throw "-Paralelo ja rotaciona cada celular por conta propria; tire o -Rotacionar"
+}
 # A fila de UCs vem da API do Minha Fatura quando ha MF_API_KEY; contas.json so
 # e exigido quando nao ha chave (uso manual, ou API fora do ar de proposito).
 $viaApi = $env:MF_API_KEY -and $env:MF_FONTE -ne 'json'
-if (-not $viaApi -and -not (Test-Path (Join-Path $PSScriptRoot 'contas.json'))) {
+if ($Modo -ne 'worker' -and -not $viaApi -and -not (Test-Path (Join-Path $PSScriptRoot 'contas.json'))) {
     throw ("Sem MF_API_KEY e sem contas.json: nao ha de onde tirar as UCs. " +
            "Defina a chave da API em credenciais.env ou crie o contas.json.")
 }
@@ -84,8 +106,12 @@ if ($Rotacionar) {
 }
 
 $python = if (Test-Path '.venv\Scripts\python.exe') { '.venv\Scripts\python.exe' } else { 'python' }
-$argumentos = switch ($Modo) {
+# @() por fora e obrigatorio: o switch desembrulha o array de um elemento em
+# string solta, e splatting de string passa letra por letra ('-','-','s',...).
+# Sem isso -Modo status/uma/maturar caiam todos no laco continuo.
+$argumentos = @(switch ($Modo) {
     'laco'    { @() }
+    'worker'  { @() }
     'uma'     { @('--uma') }
     'maturar' { @('--maturar') }
     'status'  { @('--status') }
@@ -93,7 +119,7 @@ $argumentos = switch ($Modo) {
         if (-not $Uc) { throw "-Modo agora exige -Uc <numero da UC>" }
         @('--agora', $Uc)
     }
-}
+})
 if ($Mes) {
     if ($Modo -ne 'agora') { throw "-Mes so vale com -Modo agora" }
     $argumentos += @('--mes', $Mes)
@@ -102,7 +128,10 @@ if ($Mes) {
 New-Item -ItemType Directory -Force 'faturas', 'saida', 'estado', 'perfis' | Out-Null
 
 try {
-    & $python 'orquestrador.py' @argumentos
+    $script = 'orquestrador.py'
+    if ($Modo -eq 'worker') { $script = 'worker.py' }
+    if ($Paralelo) { $script = 'worker_paralelo.py' }
+    & $python $script @argumentos
     exit $LASTEXITCODE
 } finally {
     # Rede de seguranca: o orquestrador ja restaura as metricas no proprio

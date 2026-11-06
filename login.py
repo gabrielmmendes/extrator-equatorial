@@ -370,7 +370,12 @@ def etapa2(page, dialogos, persona=None):
     de data e um postback direto. O reCAPTCHA e o mesmo hidden field, e como ja
     se passou mais de um minuto desde a etapa 1, o token precisa ser renovado.
     """
+    global PEDIU_NASC
     if not NASC:
+        # A etapa 1 passou (UC + documento aceitos) e o site quer a data. Sem
+        # ela nao ha o que tentar, e quem chama precisa saber que foi ISSO - e
+        # nao uma recusa - para nao reportar como bloqueio ou credencial errada.
+        PEDIU_NASC = True
         log("EQUATORIAL_NASC nao definido - pare aqui e informe a data do titular")
         return False
 
@@ -698,6 +703,8 @@ def tentar_login(page, dialogos, persona=None, sessao_possivel=True):
     Quem decide se e quando repetir e a agenda.py, em escala de horas ou dias,
     com backoff por motivo. Este modulo so faz a tentativa e diz o que houve.
     """
+    global PEDIU_NASC
+    PEDIU_NASC = False
     if sessao_possivel:
         log("Verificando se a sessao anterior ainda vale")
         ir_para(page, URL_FATURAS)
@@ -752,6 +759,9 @@ def garantir_login(page, dialogos, ctx=None, prazo_s=PRAZO, persona=None):
 
 
 ULTIMO_MOTIVO = None
+# True quando a ultima tentativa_login parou porque o site pediu a data de
+# nascimento e NASC estava vazio. Global pelo mesmo motivo que UC/DOC/NASC.
+PEDIU_NASC = False
 
 
 def main():

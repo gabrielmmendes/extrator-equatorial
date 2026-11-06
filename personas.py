@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """
-Personas: uma identidade de navegador por titular (CPF/CNPJ).
+Personas: uma identidade de navegador por titular (CPF/CNPJ) - ou, no worker do
+gcenergy, uma de um pool fixo que atende sempre o mesmo grupo de titulares (ver
+persona_para, no fim do arquivo).
 
 Por que trocar perfil em vez de limpar cookie
 ---------------------------------------------
@@ -108,13 +110,17 @@ def so_digitos(s):
 class Persona:
     """Identidade estavel ligada a um CPF/CNPJ."""
 
-    def __init__(self, doc, apelido=None):
+    def __init__(self, doc, apelido=None, chave=None):
         self.doc = so_digitos(doc)
-        self.apelido = apelido or self.doc[:6]
-        self.dir = PERFIS / self.doc
+        # `chave` nomeia o perfil quando ele NAO e de um titular: as personas do
+        # pool do worker (pool-01..N). Sem ela, perfil e tracos saem do documento,
+        # como sempre.
+        self.chave = chave or self.doc
+        self.apelido = apelido or self.chave[:6]
+        self.dir = PERFIS / self.chave
         # Semente propria: independente do random global, para os tracos nao
         # mudarem se alguem chamar random.seed() em outro lugar.
-        semente = int(hashlib.sha256(self.doc.encode()).hexdigest()[:16], 16)
+        semente = int(hashlib.sha256(self.chave.encode()).hexdigest()[:16], 16)
         r = random.Random(semente)
 
         # Digitacao: base + desvio. Humanos reais ficam entre ~90ms e ~280ms por
@@ -224,7 +230,7 @@ class Persona:
         return sum(f.stat().st_size for f in self.dir.rglob("*") if f.is_file())
 
     def __repr__(self):
-        return f"<Persona {self.apelido} doc={self.doc[:5]}... perfil={self.dir.name}>"
+        return f"<Persona {self.apelido} perfil={self.dir.name}>"
 
 
 # --------------------------------------------------------------------- contas
@@ -262,6 +268,41 @@ def persona_de(doc, apelido=None):
     if d not in _cache:
         _cache[d] = Persona(d, apelido)
     return _cache[d]
+
+
+# ------------------------------------------------------------ pool do worker
+#
+# O worker do gcenergy nao usa um perfil por titular: com 1500+ titulares isso
+# seria maturar 1500 perfis e fazer todo titular novo esperar um dia. Ele usa um
+# POOL FIXO de N perfis, e cada titular cai SEMPRE no mesmo (hash do documento).
+# Assim cada dispositivo ve um grupo estavel de ~1500/N contas, e cada conta ve
+# um dispositivo so - o padrao de um escritorio que cuida das contas de um
+# grupo de clientes, e nao o de um dispositivo que roda por centenas de contas.
+#
+# Mudar GCENERGY_PERSONAS remapeia a maior parte dos titulares para outro
+# perfil: faca isso raramente, e nunca so para "testar".
+
+POOL_TAMANHO = max(1, int(os.environ.get("GCENERGY_PERSONAS", "30")))
+_cache_pool = {}
+
+
+def persona_do_pool(indice):
+    """A persona `indice` (1..N) do pool, em perfis/pool-NN."""
+    chave = f"pool-{indice:02d}"
+    if chave not in _cache_pool:
+        _cache_pool[chave] = Persona("", apelido=chave, chave=chave)
+    return _cache_pool[chave]
+
+
+def pool():
+    return [persona_do_pool(i) for i in range(1, POOL_TAMANHO + 1)]
+
+
+def persona_para(doc):
+    """A persona do pool que atende este titular. Estavel por documento."""
+    d = so_digitos(doc)
+    n = int(hashlib.sha256(d.encode()).hexdigest()[:12], 16)
+    return persona_do_pool(n % POOL_TAMANHO + 1)
 
 
 if __name__ == "__main__":

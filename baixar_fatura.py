@@ -165,12 +165,16 @@ def dispensar_modal(page, timeout_s=10, persona=None):
     return None
 
 
-def consultar(page, persona=None, ano_alvo=None):
+def consultar(page, persona=None, ano_alvo=None, mais_antigo=False):
     """Consulta o historico ano a ano, do mais recente para tras.
 
     Com `ano_alvo`, consulta so aquele ano: quem pediu um mes especifico nao
     ganha nada com a varredura, e cada Consultar a mais e um postback a mais
     para a sessao explicar.
+
+    Com `mais_antigo`, varre na ordem inversa - do ano mais antigo do select para
+    frente, sem o teto de ANOS_ATRAS - e para no primeiro que trouxer linhas. E o
+    que o job MAIS_ANTIGA do worker pede: a fatura mais antiga que o portal tem.
 
     A pagina lista apenas as faturas JA PAGAS da UC, entao o ano corrente pode
     estar vazio - foi exatamente o que travou a coleta antes: o codigo fixava
@@ -203,6 +207,8 @@ def consultar(page, persona=None, ano_alvo=None):
                 f"(disponiveis: {', '.join(sorted(anos, reverse=True))})")
             return None
         candidatos = [str(ano_alvo)]
+    elif mais_antigo:
+        candidatos = sorted(anos)
     else:
         candidatos = sorted(anos, reverse=True)[:ANOS_ATRAS]
     log(f"Anos a tentar: {', '.join(candidatos)}")
@@ -398,6 +404,27 @@ def linhas_faturas(page):
     }""")
 
 
+def escolher_linha(linhas, mes=None, ano=None, mais_antiga=False):
+    """A linha do grid a baixar, ou None.
+
+    Com `mes`/`ano`, so a linha daquela competencia - nunca outra no lugar dela.
+    Sem eles, a do topo (a mais recente) ou, com `mais_antiga`, a de competencia
+    mais antiga. A comparacao e por (ano, mes): mes_do_rotulo devolve (mes, ano),
+    e comparar a tupla crua poria DEZ/2025 depois de JAN/2026.
+    """
+    if not linhas:
+        return None
+    if mes:
+        procurado = (int(mes), int(ano))
+        return next((l for l in linhas if mes_do_rotulo(l["rotulo"]) == procurado), None)
+    if mais_antiga:
+        datadas = [l for l in linhas if mes_do_rotulo(l["rotulo"])]
+        if not datadas:
+            return linhas[-1]  # a tabela vem da mais recente para a mais antiga
+        return min(datadas, key=lambda l: mes_do_rotulo(l["rotulo"])[::-1])
+    return linhas[0]  # invoice=0 = mais recente
+
+
 def baixar_mais_recente(page, ctx, ano, persona=None, mes=None):
     """Baixa o PDF de uma fatura da lista.
 
@@ -412,15 +439,11 @@ def baixar_mais_recente(page, ctx, ano, persona=None, mes=None):
         log(f"Nao achei linhas com invoice na tabela - veja estrutura-download-{ano}.json")
         return None
 
-    if mes:
-        procurado = (int(mes), int(ano))
-        alvo = next((l for l in linhas if mes_do_rotulo(l["rotulo"]) == procurado), None)
-        if not alvo:
-            disponiveis = ", ".join(l["rotulo"] for l in linhas) or "(nenhuma)"
-            log(f"Mes {mes}/{ano} nao esta na tabela. Disponiveis: {disponiveis}")
-            return None
-    else:
-        alvo = linhas[0]  # invoice=0 = mais recente
+    alvo = escolher_linha(linhas, mes, ano)
+    if not alvo:
+        disponiveis = ", ".join(l["rotulo"] for l in linhas) or "(nenhuma)"
+        log(f"Mes {mes}/{ano} nao esta na tabela. Disponiveis: {disponiveis}")
+        return None
     ref = re.sub(r"[^0-9A-Za-z]+", "-", alvo["rotulo"]).strip("-") or ano
     rotulo_log = "Fatura escolhida" if mes else "Fatura mais recente"
     log(f"{rotulo_log}: {alvo['rotulo']!r} (invoice={alvo['invoice']})")
